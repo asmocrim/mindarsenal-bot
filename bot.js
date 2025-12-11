@@ -34,6 +34,14 @@ Never comfort. Never ramble. Always end with a concrete execution step or next a
 `;
 
 // ---------- Reusable Text Snippets ----------
+const BETA_WELCOME_MESSAGE =
+  "Welcome to the MindArsenal Beta.\n" +
+  "This system will hold you to a warrior standard.\n\n" +
+  "Expect morning commands, nightly accountability, and a weekly war report.\n" +
+  "Your job: reply honestly and execute daily.\n\n" +
+  "Failure is noted. Progress is forged.\n" +
+  "Stay sharp.";
+
 const AM_PROMPT =
   "Dawn Report.\n\n" +
   "State your 3 critical objectives for today.\n\n" +
@@ -51,40 +59,47 @@ const STARTUP_PING =
   "MindArsenal core updated.\n\n" +
   "Onboarding, AM/PM check-ins, data logging and Master Asmo protocol are now active.";
 
-// ---------- Simple JSON "DB" ----------
+// ---------- JSON DB ----------
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "users.json");
 
 function loadUsers() {
   try {
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    return JSON.parse(raw);
+    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
   } catch (err) {
     return {};
   }
 }
 
-function saveUsers(users) {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2), "utf8");
+function saveUsers(data) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
 }
 
 let users = loadUsers();
 
-// Utility: get YYYY-MM-DD
+// ---------- Utils ----------
 function todayDate() {
   return new Date().toISOString().slice(0, 10);
 }
 
-// Ensure user exists in DB + migrate new fields
-function ensureUser(msg) {
-  const chatId = String(msg.chat.id);
+function formatTimeString(text) {
+  const match = text.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
 
-  if (!users[chatId]) {
-    users[chatId] = {
-      chatId,
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function ensureUser(msg) {
+  const id = String(msg.chat.id);
+
+  if (!users[id]) {
+    users[id] = {
+      chatId: id,
       firstName: msg.chat.first_name || "",
       name: "",
       timezone: "",
@@ -92,595 +107,399 @@ function ensureUser(msg) {
       pmTime: "21:00",
       goalsText: "",
       habitsText: "",
-      pending: null,          // "setgoals" | "am" | "pm" | null
-      onboardingStep: null,   // onboarding flow
+      pending: null,
+      onboardingStep: null,
       onboarded: false,
-      logs: {},               // date -> { am, pm, amPromptSent, pmPromptSent, _counted }
+      logs: {},
       stats: {
-        totalDays: 0,         // days with any check-in
-        daysWithBoth: 0,      // days with both AM + PM done
-        streakCurrent: 0,     // current consecutive full days
-        streakBest: 0         // best full-days streak
-      },
-      weeklyStats: {}         // weekKey -> summary
-    };
-  } else {
-    const u = users[chatId];
-    if (!u.amTime) u.amTime = "07:00";
-    if (!u.pmTime) u.pmTime = "21:00";
-    if (typeof u.onboarded === "undefined") {
-      u.onboarded = !!u.goalsText || !!u.habitsText;
-    }
-    if (!u.logs) u.logs = {};
-    if (!u.stats) {
-      u.stats = {
         totalDays: 0,
         daysWithBoth: 0,
         streakCurrent: 0,
         streakBest: 0
-      };
-    }
-    if (!u.weeklyStats) {
-      u.weeklyStats = {};
-    }
-  }
-
-  saveUsers(users);
-  return users[chatId];
-}
-
-// ---------- HELPERS ----------
-
-// time: "HH:MM" 24h
-function formatTimeString(text) {
-  const match = text.trim().match(/^(\d{1,2}):(\d{2})$/);
-  if (!match) return null;
-
-  let h = parseInt(match[1], 10);
-  let m = parseInt(match[2], 10);
-  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
-
-  const hh = String(h).padStart(2, "0");
-  const mm = String(m).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-// Update per-day habit stats when day is finished (after PM logged)
-function updateDailyStats(user, dateStr) {
-  if (!user.logs) return;
-  const day = user.logs[dateStr];
-  if (!day) return;
-
-  // Avoid double-counting if we already processed this date
-  if (day._counted) return;
-
-  if (!user.stats) {
-    user.stats = {
-      totalDays: 0,
-      daysWithBoth: 0,
-      streakCurrent: 0,
-      streakBest: 0
+      },
+      weeklyStats: {}
     };
   }
 
-  // Any check-in = a counted day
-  user.stats.totalDays += 1;
+  saveUsers(users);
+  return users[id];
+}
+
+function updateDailyStats(user, dateStr) {
+  const day = user.logs[dateStr];
+  if (!day || day._counted) return;
+
+  user.stats.totalDays++;
 
   if (day.am && day.pm) {
-    // fully completed day
-    user.stats.daysWithBoth += 1;
-    user.stats.streakCurrent += 1;
-    if (user.stats.streakCurrent > user.stats.streakBest) {
-      user.stats.streakBest = user.stats.streakCurrent;
-    }
+    user.stats.daysWithBoth++;
+    user.stats.streakCurrent++;
+    user.stats.streakBest = Math.max(
+      user.stats.streakBest,
+      user.stats.streakCurrent
+    );
   } else {
-    // only AM or only PM -> streak broken
     user.stats.streakCurrent = 0;
   }
 
   day._counted = true;
 }
 
-// AI coach reply for normal chat
-async function coachReply(user, userText) {
+// ---------- AI Reply ----------
+async function coachReply(user, text) {
   const name = user.name || user.firstName || "warrior";
-  const goals = user.goalsText || user.habitsText || "No mission defined yet.";
+  const goals = user.goalsText || user.habitsText || "No mission defined.";
 
-  // Local fallback in case OpenAI fails
-  const localFallback = (extraLine = "") => {
-    return (
-      `${name}, higher systems are offline.\n` +
-      (extraLine ? extraLine + "\n\n" : "") +
-      `Your current mission:\n${goals}\n\n` +
-      `You wrote:\n"${userText}"\n\n` +
-      "Pick one concrete action that moves your mission forward.\n" +
-      "Execute it now."
-    );
-  };
-
-  if (!hasOpenAI) {
-    return localFallback("OpenAI key missing or not loaded.");
-  }
+  if (!hasOpenAI)
+    return `${name}, system offline.\nYour mission:\n${goals}`;
 
   try {
-    const completion = await openai.chat.completions.create({
+    const res = await openai.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         {
           role: "user",
           content:
-            `Trainee name: ${name}.\n` +
-            `Current habits / goals:\n${goals}\n\n` +
-            `Message from trainee:\n${userText}`
+            `Trainee: ${name}\nMission:\n${goals}\n\nUser message:\n${text}`
         }
       ]
     });
 
-    const text = completion.choices[0].message.content?.trim?.() ?? "";
-    return text || localFallback("OpenAI returned an empty reply.");
+    return res.choices[0].message.content.trim();
   } catch (err) {
-    console.error("OpenAI coachReply error:", err);
-    const msg = (err && err.message) ? err.message : String(err);
-    return localFallback("OpenAI error: " + msg);
+    return `${name}, OpenAI failed.\nMessage:\n"${text}"\nExecute one step now.`;
   }
 }
 
 // ---------- COMMANDS ----------
 
-// /gpt – direct OpenAI test
+// /gpt test
 bot.onText(/\/gpt/, async (msg) => {
-  if (!hasOpenAI) {
-    bot.sendMessage(
-      msg.chat.id,
-      "DEBUG: hasOpenAI = false. OPENAI_API_KEY missing or not loaded."
-    );
-    return;
-  }
+  if (!hasOpenAI)
+    return bot.sendMessage(msg.chat.id, "OpenAI missing.");
 
-  try {
-    const res = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Reply in 1–2 ruthless lines. No emojis." },
-        { role: "user", content: "Say 'System online' in your style." }
-      ]
-    });
+  const res = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    messages: [
+      { role: "system", content: "Short. Ruthless." },
+      { role: "user", content: "Say System online." }
+    ]
+  });
 
-    const out = res.choices?.[0]?.message?.content?.trim() || "(empty response)";
-    bot.sendMessage(msg.chat.id, "GPT TEST:\n\n" + out);
-  } catch (err) {
-    console.error("OpenAI /gpt test error:", err);
-    bot.sendMessage(
-      msg.chat.id,
-      "GPT TEST ERROR: " + (err.message || String(err))
-    );
-  }
+  bot.sendMessage(msg.chat.id, res.choices[0].message.content.trim());
 });
 
-// /start – new users: onboarding; existing users: summary
+// /start
 bot.onText(/\/start/, (msg) => {
   const user = ensureUser(msg);
   const chatId = user.chatId;
 
+  // Already onboarded → show summary
   if (user.onboarded) {
-    const stats = user.stats || {};
+    const s = user.stats;
     const summary =
-      "MindArsenal Coach online.\n" +
-      "You are enlisted.\n\n" +
-      `Name: ${user.name || user.firstName || "not set"}\n` +
-      `Zone: ${user.timezone || "not set"}\n` +
-      `AM check-in: ${user.amTime}\n` +
-      `PM check-in: ${user.pmTime}\n\n` +
-      `Mission:\n${user.goalsText || "not set"}\n\n` +
+      "MindArsenal Coach online.\nYou are enlisted.\n\n" +
+      `Name: ${user.name || user.firstName}\n` +
+      `Zone: ${user.timezone}\n` +
+      `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
+      `Mission:\n${user.goalsText}\n\n` +
       "Discipline:\n" +
-      `• Full execution days (AM+PM): ${stats.daysWithBoth || 0}/${stats.totalDays || 0}\n` +
-      `• Current full-day streak: ${stats.streakCurrent || 0}\n` +
-      `• Best streak: ${stats.streakBest || 0}\n\n` +
-      "Use /onboard to reconfigure or /setgoals to update your mission.";
+      `• Full execution days: ${s.daysWithBoth}/${s.totalDays}\n` +
+      `• Current streak: ${s.streakCurrent}\n` +
+      `• Best streak: ${s.streakBest}`;
     bot.sendMessage(chatId, summary);
     return;
   }
 
+  // NEW USER FLOW
   user.onboardingStep = "name";
-  user.pending = null;
   saveUsers(users);
 
-  bot.sendMessage(
-    chatId,
-    "MindArsenal Coach online.\n" +
-      "You are entering active training.\n\n" +
-      "Step 1/5 — Name.\n" +
-      "How do I call you in reports?"
-  );
+  bot.sendMessage(chatId, BETA_WELCOME_MESSAGE).then(() => {
+    bot.sendMessage(
+      chatId,
+      "MindArsenal Coach online.\n" +
+        "Step 1/5 — Name.\nHow do I address you?"
+    );
+  });
 });
 
-// /onboard – force re-run onboarding
+// /onboard
 bot.onText(/\/onboard/, (msg) => {
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-
   user.onboardingStep = "name";
   user.onboarded = false;
-  user.pending = null;
   saveUsers(users);
 
   bot.sendMessage(
-    chatId,
-    "Onboarding reset.\n\n" +
-      "Step 1/5 — Name.\n" +
-      "How do I call you in reports?"
+    user.chatId,
+    "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?"
   );
 });
 
-// /setgoals – update only habits/goals later
+// /setgoals
 bot.onText(/\/setgoals/, (msg) => {
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-
   user.pending = "setgoals";
   saveUsers(users);
 
   bot.sendMessage(
-    chatId,
-    "Update mission.\n\n" +
-      "Send your TOP 3 habits or goals in one message.\n" +
-      "Only what matters."
+    user.chatId,
+    "Update mission.\nSend your TOP 3 habits/goals."
   );
 });
 
-// /status – today’s AM / PM status + all-time stats
+// /status
 bot.onText(/\/status/, (msg) => {
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-
   const d = todayDate();
-  const dayLog = user.logs[d] || {};
+  const day = user.logs[d] || {};
 
-  const amStatus = dayLog.am ? "DONE" : "MISSING";
-  const pmStatus = dayLog.pm ? "DONE" : "MISSING";
+  const s = user.stats;
 
-  const stats = user.stats || {};
-  const total = stats.totalDays || 0;
-  const full = stats.daysWithBoth || 0;
-  const streak = stats.streakCurrent || 0;
-  const best = stats.streakBest || 0;
-
-  const msgText =
+  const txt =
     `Status for ${d}:\n` +
-    `AM Dawn Report: ${amStatus}\n` +
-    `PM Nightly Debrief: ${pmStatus}\n\n` +
-    `All-time discipline:\n` +
-    `• Full execution days (AM+PM): ${full}/${total}\n` +
-    `• Current full-day streak: ${streak}\n` +
-    `• Best streak: ${best}`;
+    `AM: ${day.am ? "DONE" : "MISSING"}\n` +
+    `PM: ${day.pm ? "DONE" : "MISSING"}\n\n` +
+    `All-time:\n` +
+    `• Full days: ${s.daysWithBoth}/${s.totalDays}\n` +
+    `• Streak: ${s.streakCurrent}\n` +
+    `• Best: ${s.streakBest}`;
 
-  bot.sendMessage(chatId, msgText);
+  bot.sendMessage(user.chatId, txt);
 });
 
-// /test_am – manual trigger of Dawn Report for debugging
+// /test_am
 bot.onText(/\/test_am/, (msg) => {
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-  const today = todayDate();
+  if (!user.onboarded)
+    return bot.sendMessage(user.chatId, "Complete onboarding first.");
 
-  if (!user.onboarded) {
-    bot.sendMessage(
-      chatId,
-      "Protocol not armed.\nComplete onboarding with /onboard first."
-    );
-    return;
-  }
+  const d = todayDate();
+  if (!user.logs[d]) user.logs[d] = {};
 
-  if (!user.logs[today]) user.logs[today] = {};
-  const dayLog = user.logs[today];
-
-  bot.sendMessage(chatId, AM_PROMPT);
-
+  bot.sendMessage(user.chatId, AM_PROMPT);
   user.pending = "am";
-  dayLog.amPromptSent = true;
+  user.logs[d].amPromptSent = true;
   saveUsers(users);
 });
 
-// /test_pm – manual trigger of Nightly Debrief for debugging
+// /test_pm
 bot.onText(/\/test_pm/, (msg) => {
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-  const today = todayDate();
+  if (!user.onboarded)
+    return bot.sendMessage(user.chatId, "Complete onboarding first.");
 
-  if (!user.onboarded) {
-    bot.sendMessage(
-      chatId,
-      "Protocol not armed.\nComplete onboarding with /onboard first."
-    );
-    return;
-  }
+  const d = todayDate();
+  if (!user.logs[d]) user.logs[d] = {};
 
-  if (!user.logs[today]) user.logs[today] = {};
-  const dayLog = user.logs[today];
-
-  bot.sendMessage(chatId, PM_PROMPT);
-
+  bot.sendMessage(user.chatId, PM_PROMPT);
   user.pending = "pm";
-  dayLog.pmPromptSent = true;
+  user.logs[d].pmPromptSent = true;
   saveUsers(users);
 });
 
-// /test_weekly – generate Weekly War Report for last 7 days for this user
+// /test_weekly
 bot.onText(/\/test_weekly/, (msg) => {
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-
-  if (!user.onboarded) {
-    bot.sendMessage(
-      chatId,
-      "No data.\nComplete onboarding and execute for a few days first."
-    );
-    return;
-  }
+  if (!user.onboarded)
+    return bot.sendMessage(user.chatId, "No data yet.");
 
   const today = new Date();
   const todayStr = todayDate();
-  const logs = user.logs || {};
-  const dates = [];
+  const logs = user.logs;
+
+  let total = 0;
+  let full = 0;
 
   for (let i = 0; i < 7; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    dates.push(d.toISOString().slice(0, 10));
+    const key = d.toISOString().slice(0, 10);
+
+    if (logs[key]) {
+      total++;
+      if (logs[key].am && logs[key].pm) full++;
+    }
   }
 
-  let completedDays = 0;
-  let totalDays = 0;
+  const rate = total ? Math.round((full / total) * 100) : 0;
 
-  dates.forEach((d) => {
-    if (logs[d]) {
-      totalDays++;
-      if (logs[d].am && logs[d].pm) completedDays++;
-    }
-  });
-
-  const habitExecutionRate =
-    totalDays === 0 ? 0 : Math.round((completedDays / totalDays) * 100);
-
-  const weekMsg =
+  bot.sendMessage(
+    user.chatId,
     "Weekly War Report.\n\n" +
-    `Last 7 days (up to ${todayStr}):\n` +
-    `• Execution rate: ${habitExecutionRate}%\n` +
-    `• Full execution days: ${completedDays}/${totalDays}\n\n` +
-    "This week is dead.\n" +
-    "The next one is unbuilt.\n" +
-    "Dominate it.";
-
-  bot.sendMessage(chatId, weekMsg);
+      `Last 7 days (to ${todayStr}):\n` +
+      `• Execution rate: ${rate}%\n` +
+      `• Full days: ${full}/${total}\n\n` +
+      "This week is dead.\nThe next one is unbuilt.\nDominate it."
+  );
 });
 
 // ---------- MESSAGE ROUTER ----------
-
 bot.on("message", async (msg) => {
   const text = msg.text || "";
-  if (text.startsWith("/")) return; // commands handled above
+  if (text.startsWith("/")) return;
 
   const user = ensureUser(msg);
-  const chatId = user.chatId;
-  const today = todayDate();
+  const d = todayDate();
 
-  if (!user.logs[today]) user.logs[today] = user.logs[today] || {};
+  if (!user.logs[d]) user.logs[d] = {};
 
-  // ----- 1) ONBOARDING FLOW -----
+  // ONBOARDING FLOW
   if (user.onboardingStep) {
     const step = user.onboardingStep;
     const value = text.trim();
 
     if (step === "name") {
-      user.name = value || user.firstName || "";
+      user.name = value;
       user.onboardingStep = "timezone";
       saveUsers(users);
-
-      bot.sendMessage(
-        chatId,
-        "Step 2/5 — Timezone.\n" +
-          "Type your timezone.\n" +
-          "Example: Europe/Zurich"
+      return bot.sendMessage(
+        user.chatId,
+        "Step 2/5 — Timezone.\nExample: Europe/Zurich"
       );
-      return;
     }
 
     if (step === "timezone") {
       user.timezone = value;
       user.onboardingStep = "habits";
       saveUsers(users);
-
-      bot.sendMessage(
-        chatId,
-        "Step 3/5 — Mission.\n" +
-          "Write your TOP 3 habits or goals in one message.\n\n" +
-          "Example:\n" +
-          "1) Train 5× per week\n" +
-          "2) Build MindArsenal\n" +
-          "3) Study 1h daily"
+      return bot.sendMessage(
+        user.chatId,
+        "Step 3/5 — Mission.\nSend your TOP 3 habits/goals."
       );
-      return;
     }
 
     if (step === "habits") {
-      user.habitsText = value;
       user.goalsText = value;
+      user.habitsText = value;
       user.onboardingStep = "amTime";
       saveUsers(users);
-
-      bot.sendMessage(
-        chatId,
-        "Step 4/5 — AM time.\n" +
-          "When should Dawn Report hit you?\n" +
-          "Use 24h format HH:MM.\n" +
-          "Example: 07:00"
+      return bot.sendMessage(
+        user.chatId,
+        "Step 4/5 — AM time.\nExample: 07:00"
       );
-      return;
     }
 
     if (step === "amTime") {
-      const formatted = formatTimeString(value);
-      if (!formatted) {
-        bot.sendMessage(
-          chatId,
-          "Invalid time format.\n" +
-            "Use HH:MM in 24h format.\n" +
-            "Examples: 06:30, 07:00, 09:15."
+      const t = formatTimeString(value);
+      if (!t)
+        return bot.sendMessage(
+          user.chatId,
+          "Invalid format. Use HH:MM (24h)."
         );
-        return;
-      }
-      user.amTime = formatted;
+
+      user.amTime = t;
       user.onboardingStep = "pmTime";
       saveUsers(users);
-
-      bot.sendMessage(
-        chatId,
-        "Step 5/5 — PM time.\n" +
-          "When should Nightly Debrief hit you?\n" +
-          "Use 24h format HH:MM.\n" +
-          "Example: 21:00"
+      return bot.sendMessage(
+        user.chatId,
+        "Step 5/5 — PM time.\nExample: 21:00"
       );
-      return;
     }
 
     if (step === "pmTime") {
-      const formatted = formatTimeString(value);
-      if (!formatted) {
-        bot.sendMessage(
-          chatId,
-          "Invalid time format.\n" +
-            "Use HH:MM in 24h format.\n" +
-            "Examples: 20:00, 21:30, 22:00."
+      const t = formatTimeString(value);
+      if (!t)
+        return bot.sendMessage(
+          user.chatId,
+          "Invalid format. Use HH:MM (24h)."
         );
-        return;
-      }
-      user.pmTime = formatted;
+
+      user.pmTime = t;
       user.onboardingStep = null;
       user.onboarded = true;
       saveUsers(users);
 
       const summary =
-        "Onboarding complete.\n" +
-        "Protocol armed.\n\n" +
-        `Name: ${user.name || user.firstName}\n` +
+        "Onboarding complete.\nProtocol armed.\n\n" +
+        `Name: ${user.name}\n` +
         `Zone: ${user.timezone}\n` +
-        `AM check-in: ${user.amTime}\n` +
-        `PM check-in: ${user.pmTime}\n\n` +
+        `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
         `Mission:\n${user.goalsText}\n\n` +
-        "Dawn and Nightly reports will hit at your times.\n" +
-        "You report. No excuses.";
-      bot.sendMessage(chatId, summary);
-      return;
+        "Reports will hit at your times.\nRespond. No excuses.";
+
+      return bot.sendMessage(user.chatId, summary);
     }
   }
 
-  // ----- 2) OTHER PENDING STATES -----
-
-  // /setgoals flow
+  // SETGOALS flow
   if (user.pending === "setgoals") {
     user.goalsText = text.trim();
     user.habitsText = text.trim();
     user.pending = null;
     saveUsers(users);
-
-    bot.sendMessage(
-      chatId,
-      "Mission updated.\n\n" +
-        "Current top habits / goals:\n" +
-        user.goalsText
+    return bot.sendMessage(
+      user.chatId,
+      "Mission updated:\n" + user.goalsText
     );
-    return;
   }
 
-  // AM answer
+  // AM
   if (user.pending === "am") {
-    user.logs[today].am = {
-      text: text.trim(),
-      timestamp: new Date().toISOString()
-    };
+    user.logs[d].am = { text, timestamp: new Date().toISOString() };
     user.pending = null;
     saveUsers(users);
-
-    bot.sendMessage(
-      chatId,
-      "Dawn Report logged.\n" +
-        "Prioritize. Execute.\n" +
-        "Zero hesitation."
+    return bot.sendMessage(
+      user.chatId,
+      "Dawn Report logged.\nExecute."
     );
-    return;
   }
 
-  // PM answer
+  // PM
   if (user.pending === "pm") {
-    user.logs[today].pm = {
-      text: text.trim(),
-      timestamp: new Date().toISOString()
-    };
+    user.logs[d].pm = { text, timestamp: new Date().toISOString() };
     user.pending = null;
 
-    // Update all-time stats when a day is “closed” with PM
-    updateDailyStats(user, today);
-
+    updateDailyStats(user, d);
     saveUsers(users);
 
-    bot.sendMessage(
-      chatId,
-      "Nightly Debrief logged.\n" +
-        "Success or failure — you own it.\n" +
-        "Tomorrow the standard rises."
+    return bot.sendMessage(
+      user.chatId,
+      "Nightly Debrief logged.\nTomorrow the standard rises."
     );
-    return;
   }
 
-  // ----- 3) Fallback → Master Asmo brain -----
+  // AI fallback
   const reply = await coachReply(user, text);
-  bot.sendMessage(chatId, reply);
+  bot.sendMessage(user.chatId, reply);
 });
-
-// ---------- CRON: AM/PM per user (check every minute) ----------
-
+// ---------- CRON: AM/PM per user ----------
 cron.schedule("* * * * *", () => {
   const now = new Date();
   const hh = String(now.getHours()).padStart(2, "0");
   const mm = String(now.getMinutes()).padStart(2, "0");
-  const currentTime = `${hh}:${mm}`;
-  const today = todayDate();
+  const current = `${hh}:${mm}`;
+  const d = todayDate();
 
   let changed = false;
 
   Object.values(users).forEach((user) => {
     if (!user.onboarded) return;
+    if (!user.logs[d]) user.logs[d] = {};
 
-    if (!user.logs[today]) user.logs[today] = user.logs[today] || {};
-    const dayLog = user.logs[today];
+    const day = user.logs[d];
 
-    // AM check
-    const amTime = user.amTime || "07:00";
-    if (currentTime === amTime && !dayLog.amPromptSent) {
+    if (current === user.amTime && !day.amPromptSent) {
       bot.sendMessage(user.chatId, AM_PROMPT);
       user.pending = "am";
-      dayLog.amPromptSent = true;
+      day.amPromptSent = true;
       changed = true;
     }
 
-    // PM check
-    const pmTime = user.pmTime || "21:00";
-    if (currentTime === pmTime && !dayLog.pmPromptSent) {
+    if (current === user.pmTime && !day.pmPromptSent) {
       bot.sendMessage(user.chatId, PM_PROMPT);
       user.pending = "pm";
-      dayLog.pmPromptSent = true;
+      day.pmPromptSent = true;
       changed = true;
     }
   });
 
-  if (changed) {
-    saveUsers(users);
-  }
+  if (changed) saveUsers(users);
 });
 
-// ---------- CRON: Weekly War Report (Sunday 18:00) ----------
-
+// ---------- CRON: Weekly Report ----------
 cron.schedule("0 18 * * 0", () => {
   const today = new Date();
   const todayStr = todayDate();
@@ -688,57 +507,35 @@ cron.schedule("0 18 * * 0", () => {
   Object.values(users).forEach((user) => {
     if (!user.onboarded) return;
 
-    const logs = user.logs || {};
-    const dates = [];
+    const logs = user.logs;
+    let total = 0;
+    let full = 0;
 
     for (let i = 0; i < 7; i++) {
       const d = new Date(today);
       d.setDate(d.getDate() - i);
-      dates.push(d.toISOString().slice(0, 10));
+      const key = d.toISOString().slice(0, 10);
+
+      if (logs[key]) {
+        total++;
+        if (logs[key].am && logs[key].pm) full++;
+      }
     }
 
-    let completedDays = 0;
-    let totalDays = 0;
+    const rate = total ? Math.round((full / total) * 100) : 0;
 
-    dates.forEach((d) => {
-      if (logs[d]) {
-        totalDays++;
-        if (logs[d].am && logs[d].pm) completedDays++;
-      }
-    });
-
-    const habitExecutionRate =
-      totalDays === 0 ? 0 : Math.round((completedDays / totalDays) * 100);
-
-    const weekMsg =
+    bot.sendMessage(
+      user.chatId,
       "Weekly War Report.\n\n" +
-      `Last 7 days (up to ${todayStr}):\n` +
-      `• Execution rate: ${habitExecutionRate}%\n` +
-      `• Full execution days: ${completedDays}/${totalDays}\n\n` +
-      "This week is dead.\n" +
-      "The next one is unbuilt.\n" +
-      "Dominate it.";
-
-    bot.sendMessage(user.chatId, weekMsg);
-
-    // Save weekly snapshot in JSON
-    const datesSorted = [...dates].sort(); // oldest -> newest
-    const weekKey = `${datesSorted[0]}_${datesSorted[datesSorted.length - 1]}`;
-    if (!user.weeklyStats) user.weeklyStats = {};
-    user.weeklyStats[weekKey] = {
-      startDate: datesSorted[0],
-      endDate: datesSorted[datesSorted.length - 1],
-      habitExecutionRate,
-      completedDays,
-      totalDays,
-      generatedAt: new Date().toISOString()
-    };
+        `Last 7 days (to ${todayStr}):\n` +
+        `• Execution rate: ${rate}%\n` +
+        `• Full days: ${full}/${total}\n\n` +
+        "This week is dead.\nThe next one is unbuilt.\nDominate it."
+    );
   });
-
-  saveUsers(users);
 });
 
-// ---------- Startup ping ----------
+// ---------- Startup Ping ----------
 Object.values(users).forEach((user) => {
   bot.sendMessage(user.chatId, STARTUP_PING);
 });
