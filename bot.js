@@ -6,14 +6,19 @@ const path = require("path");
 const OpenAI = require("openai");
 require("dotenv").config();
 
-// ---------- ENV DEBUG ----------
-console.log("[ENV] OPENAI_API_KEY present:", !!process.env.OPENAI_API_KEY);
-console.log("[ENV] BOT_TOKEN present:", !!process.env.BOT_TOKEN);
+const logger = require("./logger");
 
 // ---------- Telegram & OpenAI ----------
 const token = process.env.BOT_TOKEN;
+
+logger.info({
+  event: "env",
+  OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+  BOT_TOKEN: !!process.env.BOT_TOKEN,
+});
+
 if (!token) {
-  console.error("❌ BOT_TOKEN missing in .env");
+  logger.fatal({ event: "fatal", msg: "BOT_TOKEN missing in .env" });
   process.exit(1);
 }
 
@@ -62,21 +67,90 @@ const STARTUP_PING =
 // ---------- JSON DB ----------
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "users.json");
+const RUNTIME_FILE = path.join(DATA_DIR, "runtime.json");
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 function loadUsers() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    logger.info({ event: "users_load", count: Object.keys(data).length });
+    return data;
   } catch (err) {
+    logger.warn({ event: "users_load_fail", err: err?.message || String(err) });
     return {};
   }
 }
 
 function saveUsers(data) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  ensureDataDir();
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+  logger.info({ event: "users_save", count: Object.keys(data).length });
+}
+
+function loadRuntime() {
+  try {
+    const rt = JSON.parse(fs.readFileSync(RUNTIME_FILE, "utf8"));
+    return rt;
+  } catch {
+    return {
+      started_at: new Date().toISOString(),
+      jobs: {},
+      counters: { send_ok: 0, send_err: 0 },
+    };
+  }
+}
+
+function saveRuntime(rt) {
+  ensureDataDir();
+  fs.writeFileSync(RUNTIME_FILE, JSON.stringify(rt, null, 2), "utf8");
+}
+
+const runtime = loadRuntime();
+
+function markJob(jobName, status, extra = {}) {
+  runtime.jobs[jobName] = {
+    ...runtime.jobs[jobName],
+    last_status: status,
+    last_at: new Date().toISOString(),
+    ...extra,
+  };
+  saveRuntime(runtime);
 }
 
 let users = loadUsers();
+
+// ---------- Safe Send Wrapper ----------
+async function safeSend(chatId, text, extra = {}) {
+  try {
+    const res = await bot.sendMessage(chatId, text, extra);
+
+    runtime.counters.send_ok++;
+    saveRuntime(runtime);
+
+    logger.info({
+      event: "msg_out",
+      chat_id: String(chatId),
+      message_id: res?.message_id,
+      text_len: (text || "").length,
+    });
+
+    return res;
+  } catch (err) {
+    runtime.counters.send_err++;
+    saveRuntime(runtime);
+
+    logger.error({
+      event: "send_error",
+      chat_id: String(chatId),
+      err: err?.message || String(err),
+    });
+
+    throw err;
+  }
+}
 
 // ---------- Utils ----------
 function todayDate() {
@@ -115,10 +189,12 @@ function ensureUser(msg) {
         totalDays: 0,
         daysWithBoth: 0,
         streakCurrent: 0,
-        streakBest: 0
+        streakBest: 0,
       },
-      weeklyStats: {}
+      weeklyStats: {},
     };
+
+    logger.info({ event: "user_new", user_id: id });
   }
 
   saveUsers(users);
@@ -134,10 +210,7 @@ function updateDailyStats(user, dateStr) {
   if (day.am && day.pm) {
     user.stats.daysWithBoth++;
     user.stats.streakCurrent++;
-    user.stats.streakBest = Math.max(
-      user.stats.streakBest,
-      user.stats.streakCurrent
-    );
+    user.stats.streakBest = Math.max(user.stats.streakBest, user.stats.streakCurrent);
   } else {
     user.stats.streakCurrent = 0;
   }
@@ -150,24 +223,38 @@ async function coachReply(user, text) {
   const name = user.name || user.firstName || "warrior";
   const goals = user.goalsText || user.habitsText || "No mission defined.";
 
-  if (!hasOpenAI)
+  if (!hasOpenAI) {
+    logger.warn({ event: "openai_missing", user_id: user.chatId });
     return `${name}, system offline.\nYour mission:\n${goals}`;
+  }
 
   try {
+    logger.info({
+      event: "openai_call",
+      user_id: user.chatId,
+      model: OPENAI_MODEL,
+      text_len: (text || "").length,
+    });
+
     const res = await openai.chat.completions.create({
       model: OPENAI_MODEL,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         {
           role: "user",
-          content:
-            `Trainee: ${name}\nMission:\n${goals}\n\nUser message:\n${text}`
-        }
-      ]
+          content: `Trainee: ${name}\nMission:\n${goals}\n\nUser message:\n${text}`,
+        },
+      ],
     });
 
     return res.choices[0].message.content.trim();
   } catch (err) {
+    logger.error({
+      event: "openai_error",
+      user_id: user.chatId,
+      err: err?.message || String(err),
+    });
+
     return `${name}, OpenAI failed.\nMessage:\n"${text}"\nExecute one step now.`;
   }
 }
@@ -176,18 +263,22 @@ async function coachReply(user, text) {
 
 // /gpt test
 bot.onText(/\/gpt/, async (msg) => {
-  if (!hasOpenAI)
-    return bot.sendMessage(msg.chat.id, "OpenAI missing.");
+  if (!hasOpenAI) return safeSend(msg.chat.id, "OpenAI missing.");
 
-  const res = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    messages: [
-      { role: "system", content: "Short. Ruthless." },
-      { role: "user", content: "Say System online." }
-    ]
-  });
+  try {
+    const res = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: "system", content: "Short. Ruthless." },
+        { role: "user", content: "Say System online." },
+      ],
+    });
 
-  bot.sendMessage(msg.chat.id, res.choices[0].message.content.trim());
+    safeSend(msg.chat.id, res.choices[0].message.content.trim());
+  } catch (err) {
+    logger.error({ event: "openai_error", user_id: String(msg.chat.id), err: err?.message || String(err) });
+    safeSend(msg.chat.id, "OpenAI failed.");
+  }
 });
 
 // /start
@@ -208,7 +299,8 @@ bot.onText(/\/start/, (msg) => {
       `• Full execution days: ${s.daysWithBoth}/${s.totalDays}\n` +
       `• Current streak: ${s.streakCurrent}\n` +
       `• Best streak: ${s.streakBest}`;
-    bot.sendMessage(chatId, summary);
+
+    safeSend(chatId, summary);
     return;
   }
 
@@ -216,11 +308,10 @@ bot.onText(/\/start/, (msg) => {
   user.onboardingStep = "name";
   saveUsers(users);
 
-  bot.sendMessage(chatId, BETA_WELCOME_MESSAGE).then(() => {
-    bot.sendMessage(
+  safeSend(chatId, BETA_WELCOME_MESSAGE).then(() => {
+    safeSend(
       chatId,
-      "MindArsenal Coach online.\n" +
-        "Step 1/5 — Name.\nHow do I address you?"
+      "MindArsenal Coach online.\n" + "Step 1/5 — Name.\nHow do I address you?"
     );
   });
 });
@@ -232,10 +323,7 @@ bot.onText(/\/onboard/, (msg) => {
   user.onboarded = false;
   saveUsers(users);
 
-  bot.sendMessage(
-    user.chatId,
-    "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?"
-  );
+  safeSend(user.chatId, "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?");
 });
 
 // /setgoals
@@ -244,10 +332,7 @@ bot.onText(/\/setgoals/, (msg) => {
   user.pending = "setgoals";
   saveUsers(users);
 
-  bot.sendMessage(
-    user.chatId,
-    "Update mission.\nSend your TOP 3 habits/goals."
-  );
+  safeSend(user.chatId, "Update mission.\nSend your TOP 3 habits/goals.");
 });
 
 // /status
@@ -255,7 +340,6 @@ bot.onText(/\/status/, (msg) => {
   const user = ensureUser(msg);
   const d = todayDate();
   const day = user.logs[d] || {};
-
   const s = user.stats;
 
   const txt =
@@ -267,44 +351,45 @@ bot.onText(/\/status/, (msg) => {
     `• Streak: ${s.streakCurrent}\n` +
     `• Best: ${s.streakBest}`;
 
-  bot.sendMessage(user.chatId, txt);
+  safeSend(user.chatId, txt);
 });
 
 // /test_am
 bot.onText(/\/test_am/, (msg) => {
   const user = ensureUser(msg);
-  if (!user.onboarded)
-    return bot.sendMessage(user.chatId, "Complete onboarding first.");
+  if (!user.onboarded) return safeSend(user.chatId, "Complete onboarding first.");
 
   const d = todayDate();
   if (!user.logs[d]) user.logs[d] = {};
 
-  bot.sendMessage(user.chatId, AM_PROMPT);
+  safeSend(user.chatId, AM_PROMPT);
   user.pending = "am";
   user.logs[d].amPromptSent = true;
   saveUsers(users);
+
+  logger.info({ event: "job_fire", job: "am_prompt_manual", user_id: user.chatId });
 });
 
 // /test_pm
 bot.onText(/\/test_pm/, (msg) => {
   const user = ensureUser(msg);
-  if (!user.onboarded)
-    return bot.sendMessage(user.chatId, "Complete onboarding first.");
+  if (!user.onboarded) return safeSend(user.chatId, "Complete onboarding first.");
 
   const d = todayDate();
   if (!user.logs[d]) user.logs[d] = {};
 
-  bot.sendMessage(user.chatId, PM_PROMPT);
+  safeSend(user.chatId, PM_PROMPT);
   user.pending = "pm";
   user.logs[d].pmPromptSent = true;
   saveUsers(users);
+
+  logger.info({ event: "job_fire", job: "pm_prompt_manual", user_id: user.chatId });
 });
 
 // /test_weekly
 bot.onText(/\/test_weekly/, (msg) => {
   const user = ensureUser(msg);
-  if (!user.onboarded)
-    return bot.sendMessage(user.chatId, "No data yet.");
+  if (!user.onboarded) return safeSend(user.chatId, "No data yet.");
 
   const today = new Date();
   const todayStr = todayDate();
@@ -326,7 +411,7 @@ bot.onText(/\/test_weekly/, (msg) => {
 
   const rate = total ? Math.round((full / total) * 100) : 0;
 
-  bot.sendMessage(
+  safeSend(
     user.chatId,
     "Weekly War Report.\n\n" +
       `Last 7 days (to ${todayStr}):\n` +
@@ -334,11 +419,22 @@ bot.onText(/\/test_weekly/, (msg) => {
       `• Full days: ${full}/${total}\n\n` +
       "This week is dead.\nThe next one is unbuilt.\nDominate it."
   );
+
+  logger.info({ event: "job_fire", job: "weekly_manual", user_id: user.chatId, rate, full, total });
 });
 
 // ---------- MESSAGE ROUTER ----------
 bot.on("message", async (msg) => {
   const text = msg.text || "";
+
+  logger.info({
+    event: "msg_in",
+    user_id: String(msg?.from?.id || ""),
+    chat_id: String(msg?.chat?.id || ""),
+    has_text: !!msg.text,
+    text_len: (text || "").length,
+  });
+
   if (text.startsWith("/")) return;
 
   const user = ensureUser(msg);
@@ -355,57 +451,40 @@ bot.on("message", async (msg) => {
       user.name = value;
       user.onboardingStep = "timezone";
       saveUsers(users);
-      return bot.sendMessage(
-        user.chatId,
-        "Step 2/5 — Timezone.\nExample: Europe/Zurich"
-      );
+      return safeSend(user.chatId, "Step 2/5 — Timezone.\nExample: Europe/Zurich");
     }
 
     if (step === "timezone") {
       user.timezone = value;
       user.onboardingStep = "habits";
       saveUsers(users);
-      return bot.sendMessage(
-        user.chatId,
-        "Step 3/5 — Mission.\nSend your TOP 3 habits/goals."
-      );
+      return safeSend(user.chatId, "Step 3/5 — Mission.\nSend your TOP 3 habits/goals.");
     }
 
     if (step === "habits") {
       user.goalsText = value;
       user.habitsText = value;
+
+      logger.info({ event: "habit_save", user_id: user.chatId, changed: ["goalsText", "habitsText"] });
+
       user.onboardingStep = "amTime";
       saveUsers(users);
-      return bot.sendMessage(
-        user.chatId,
-        "Step 4/5 — AM time.\nExample: 07:00"
-      );
+      return safeSend(user.chatId, "Step 4/5 — AM time.\nExample: 07:00");
     }
 
     if (step === "amTime") {
       const t = formatTimeString(value);
-      if (!t)
-        return bot.sendMessage(
-          user.chatId,
-          "Invalid format. Use HH:MM (24h)."
-        );
+      if (!t) return safeSend(user.chatId, "Invalid format. Use HH:MM (24h).");
 
       user.amTime = t;
       user.onboardingStep = "pmTime";
       saveUsers(users);
-      return bot.sendMessage(
-        user.chatId,
-        "Step 5/5 — PM time.\nExample: 21:00"
-      );
+      return safeSend(user.chatId, "Step 5/5 — PM time.\nExample: 21:00");
     }
 
     if (step === "pmTime") {
       const t = formatTimeString(value);
-      if (!t)
-        return bot.sendMessage(
-          user.chatId,
-          "Invalid format. Use HH:MM (24h)."
-        );
+      if (!t) return safeSend(user.chatId, "Invalid format. Use HH:MM (24h).");
 
       user.pmTime = t;
       user.onboardingStep = null;
@@ -420,7 +499,7 @@ bot.on("message", async (msg) => {
         `Mission:\n${user.goalsText}\n\n` +
         "Reports will hit at your times.\nRespond. No excuses.";
 
-      return bot.sendMessage(user.chatId, summary);
+      return safeSend(user.chatId, summary);
     }
   }
 
@@ -429,11 +508,11 @@ bot.on("message", async (msg) => {
     user.goalsText = text.trim();
     user.habitsText = text.trim();
     user.pending = null;
+
+    logger.info({ event: "habit_save", user_id: user.chatId, changed: ["goalsText", "habitsText"] });
+
     saveUsers(users);
-    return bot.sendMessage(
-      user.chatId,
-      "Mission updated:\n" + user.goalsText
-    );
+    return safeSend(user.chatId, "Mission updated:\n" + user.goalsText);
   }
 
   // AM
@@ -441,10 +520,10 @@ bot.on("message", async (msg) => {
     user.logs[d].am = { text, timestamp: new Date().toISOString() };
     user.pending = null;
     saveUsers(users);
-    return bot.sendMessage(
-      user.chatId,
-      "Dawn Report logged.\nExecute."
-    );
+
+    logger.info({ event: "am_reply", user_id: user.chatId, date: d });
+
+    return safeSend(user.chatId, "Dawn Report logged.\nExecute.");
   }
 
   // PM
@@ -455,16 +534,16 @@ bot.on("message", async (msg) => {
     updateDailyStats(user, d);
     saveUsers(users);
 
-    return bot.sendMessage(
-      user.chatId,
-      "Nightly Debrief logged.\nTomorrow the standard rises."
-    );
+    logger.info({ event: "pm_reply", user_id: user.chatId, date: d });
+
+    return safeSend(user.chatId, "Nightly Debrief logged.\nTomorrow the standard rises.");
   }
 
   // AI fallback
   const reply = await coachReply(user, text);
-  bot.sendMessage(user.chatId, reply);
+  safeSend(user.chatId, reply);
 });
+
 // ---------- CRON: AM/PM per user ----------
 cron.schedule("* * * * *", () => {
   const now = new Date();
@@ -472,6 +551,9 @@ cron.schedule("* * * * *", () => {
   const mm = String(now.getMinutes()).padStart(2, "0");
   const current = `${hh}:${mm}`;
   const d = todayDate();
+
+  // mark tick so watchdog can detect if cron is dead
+  markJob("cron_tick_am_pm", "ok", { current });
 
   let changed = false;
 
@@ -482,16 +564,22 @@ cron.schedule("* * * * *", () => {
     const day = user.logs[d];
 
     if (current === user.amTime && !day.amPromptSent) {
-      bot.sendMessage(user.chatId, AM_PROMPT);
+      safeSend(user.chatId, AM_PROMPT);
       user.pending = "am";
       day.amPromptSent = true;
+
+      logger.info({ event: "job_fire", job: "am_prompt", user_id: user.chatId, at: current });
+
       changed = true;
     }
 
     if (current === user.pmTime && !day.pmPromptSent) {
-      bot.sendMessage(user.chatId, PM_PROMPT);
+      safeSend(user.chatId, PM_PROMPT);
       user.pending = "pm";
       day.pmPromptSent = true;
+
+      logger.info({ event: "job_fire", job: "pm_prompt", user_id: user.chatId, at: current });
+
       changed = true;
     }
   });
@@ -499,10 +587,29 @@ cron.schedule("* * * * *", () => {
   if (changed) saveUsers(users);
 });
 
+// ---------- Watchdog: detect cron stop ----------
+cron.schedule("*/5 * * * *", () => {
+  const last = runtime.jobs["cron_tick_am_pm"]?.last_at;
+  if (!last) return;
+
+  const diffMs = Date.now() - new Date(last).getTime();
+  if (diffMs > 6 * 60 * 1000) {
+    logger.error({
+      event: "watchdog_missed",
+      job: "cron_tick_am_pm",
+      last_at: last,
+      diff_minutes: Math.round(diffMs / 60000),
+    });
+  }
+});
+
 // ---------- CRON: Weekly Report ----------
 cron.schedule("0 18 * * 0", () => {
   const today = new Date();
   const todayStr = todayDate();
+
+  markJob("weekly_report", "fired", { when: todayStr });
+  logger.info({ event: "job_fire", job: "weekly_report", date: todayStr });
 
   Object.values(users).forEach((user) => {
     if (!user.onboarded) return;
@@ -524,7 +631,7 @@ cron.schedule("0 18 * * 0", () => {
 
     const rate = total ? Math.round((full / total) * 100) : 0;
 
-    bot.sendMessage(
+    safeSend(
       user.chatId,
       "Weekly War Report.\n\n" +
         `Last 7 days (to ${todayStr}):\n` +
@@ -532,12 +639,24 @@ cron.schedule("0 18 * * 0", () => {
         `• Full days: ${full}/${total}\n\n` +
         "This week is dead.\nThe next one is unbuilt.\nDominate it."
     );
+
+    logger.info({ event: "weekly_sent", user_id: user.chatId, rate, full, total });
   });
 });
 
 // ---------- Startup Ping ----------
 Object.values(users).forEach((user) => {
-  bot.sendMessage(user.chatId, STARTUP_PING);
+  safeSend(user.chatId, STARTUP_PING);
 });
 
-console.log("MindArsenal bot running. Polling started.");
+logger.info({ event: "boot", msg: "MindArsenal bot running. Polling started." });
+
+// ---------- Crash visibility ----------
+process.on("unhandledRejection", (reason) => {
+  logger.fatal({ event: "unhandledRejection", reason: String(reason) });
+});
+
+process.on("uncaughtException", (err) => {
+  logger.fatal({ event: "uncaughtException", err: err?.stack || err?.message || String(err) });
+  process.exit(1);
+});
