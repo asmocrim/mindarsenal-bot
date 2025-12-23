@@ -10,10 +10,13 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "body-parser": "^2.2.1",
     "dotenv": "^17.2.3",
+    "express": "^5.2.1",
     "node-cron": "^4.2.1",
     "node-telegram-bot-api": "^0.66.0",
     "openai": "^6.10.0",
-    "pino": "^10.1.0"
+    "pino": "^10.1.0",
+    "twilio": "^5.11.1"
   }
 }

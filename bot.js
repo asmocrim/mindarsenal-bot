@@ -6,15 +6,22 @@ const path = require("path");
 const OpenAI = require("openai");
 require("dotenv").config();
 
+const express = require("express");
+const bodyParser = require("body-parser");
+const twilio = require("twilio");
+
 const logger = require("./logger");
 
-// ---------- Telegram & OpenAI ----------
+// ---------- ENV ----------
 const token = process.env.BOT_TOKEN;
 
 logger.info({
   event: "env",
   OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
   BOT_TOKEN: !!process.env.BOT_TOKEN,
+  TWILIO_ACCOUNT_SID: !!process.env.TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN: !!process.env.TWILIO_AUTH_TOKEN,
+  TWILIO_WHATSAPP_FROM: !!process.env.TWILIO_WHATSAPP_FROM,
 });
 
 if (!token) {
@@ -22,11 +29,25 @@ if (!token) {
   process.exit(1);
 }
 
+// ---------- Telegram ----------
 const bot = new TelegramBot(token, { polling: true });
 
+// ---------- OpenAI ----------
 const hasOpenAI = !!process.env.OPENAI_API_KEY;
 const openai = hasOpenAI ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const OPENAI_MODEL = "gpt-4o-mini";
+
+// ---------- Twilio WhatsApp ----------
+const hasTwilio =
+  !!process.env.TWILIO_ACCOUNT_SID &&
+  !!process.env.TWILIO_AUTH_TOKEN &&
+  !!process.env.TWILIO_WHATSAPP_FROM;
+
+const twilioClient = hasTwilio
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
+
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // "whatsapp:+14155238886"
 
 // ---------- Master Asmo System Prompt ----------
 const SYSTEM_PROMPT = `
@@ -122,36 +143,6 @@ function markJob(jobName, status, extra = {}) {
 
 let users = loadUsers();
 
-// ---------- Safe Send Wrapper ----------
-async function safeSend(chatId, text, extra = {}) {
-  try {
-    const res = await bot.sendMessage(chatId, text, extra);
-
-    runtime.counters.send_ok++;
-    saveRuntime(runtime);
-
-    logger.info({
-      event: "msg_out",
-      chat_id: String(chatId),
-      message_id: res?.message_id,
-      text_len: (text || "").length,
-    });
-
-    return res;
-  } catch (err) {
-    runtime.counters.send_err++;
-    saveRuntime(runtime);
-
-    logger.error({
-      event: "send_error",
-      chat_id: String(chatId),
-      err: err?.message || String(err),
-    });
-
-    throw err;
-  }
-}
-
 // ---------- Utils ----------
 function todayDate() {
   return new Date().toISOString().slice(0, 10);
@@ -168,13 +159,23 @@ function formatTimeString(text) {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-function ensureUser(msg) {
-  const id = String(msg.chat.id);
+function normalizeWhatsAppFrom(from) {
+  // "whatsapp:+4179..." -> "+4179..."
+  if (!from) return "";
+  return String(from).replace("whatsapp:", "").trim();
+}
 
-  if (!users[id]) {
-    users[id] = {
-      chatId: id,
-      firstName: msg.chat.first_name || "",
+// ---------- User Model (supports Telegram + WhatsApp) ----------
+function ensureUserByKey(userKey, defaults = {}) {
+  if (!users[userKey]) {
+    users[userKey] = {
+      userKey,
+
+      // channels
+      telegramChatId: defaults.telegramChatId || null,
+      whatsappFrom: defaults.whatsappFrom || null,
+
+      firstName: defaults.firstName || "",
       name: "",
       timezone: "",
       amTime: "07:00",
@@ -194,11 +195,20 @@ function ensureUser(msg) {
       weeklyStats: {},
     };
 
-    logger.info({ event: "user_new", user_id: id });
+    logger.info({ event: "user_new", user_key: userKey });
+    saveUsers(users);
+  }
+
+  // keep channel ids updated if provided
+  if (defaults.telegramChatId && !users[userKey].telegramChatId) {
+    users[userKey].telegramChatId = defaults.telegramChatId;
+  }
+  if (defaults.whatsappFrom && !users[userKey].whatsappFrom) {
+    users[userKey].whatsappFrom = defaults.whatsappFrom;
   }
 
   saveUsers(users);
-  return users[id];
+  return users[userKey];
 }
 
 function updateDailyStats(user, dateStr) {
@@ -218,20 +228,108 @@ function updateDailyStats(user, dateStr) {
   day._counted = true;
 }
 
+// ---------- Sending (Telegram + WhatsApp) ----------
+async function safeSendTelegram(chatId, text, extra = {}) {
+  try {
+    const res = await bot.sendMessage(chatId, text, extra);
+
+    runtime.counters.send_ok++;
+    saveRuntime(runtime);
+
+    logger.info({
+      event: "msg_out",
+      channel: "telegram",
+      chat_id: String(chatId),
+      message_id: res?.message_id,
+      text_len: (text || "").length,
+    });
+
+    return res;
+  } catch (err) {
+    runtime.counters.send_err++;
+    saveRuntime(runtime);
+
+    logger.error({
+      event: "send_error",
+      channel: "telegram",
+      chat_id: String(chatId),
+      err: err?.message || String(err),
+    });
+
+    throw err;
+  }
+}
+
+async function safeSendWhatsApp(whatsappTo, text) {
+  if (!hasTwilio) {
+    logger.warn({ event: "twilio_missing", msg: "Twilio env vars missing." });
+    throw new Error("Twilio missing");
+  }
+
+  try {
+    const res = await twilioClient.messages.create({
+      from: TWILIO_WHATSAPP_FROM,
+      to: `whatsapp:${whatsappTo.startsWith("+") ? whatsappTo : "+" + whatsappTo}`,
+      body: text,
+    });
+
+    runtime.counters.send_ok++;
+    saveRuntime(runtime);
+
+    logger.info({
+      event: "msg_out",
+      channel: "whatsapp",
+      to: whatsappTo,
+      sid: res?.sid,
+      text_len: (text || "").length,
+    });
+
+    return res;
+  } catch (err) {
+    runtime.counters.send_err++;
+    saveRuntime(runtime);
+
+    logger.error({
+      event: "send_error",
+      channel: "whatsapp",
+      to: whatsappTo,
+      err: err?.message || String(err),
+    });
+
+    throw err;
+  }
+}
+
+// Send to user's available channel(s).
+// For scheduled prompts we send to BOTH if user has both.
+async function sendToUser(user, text) {
+  const tasks = [];
+
+  if (user.telegramChatId) tasks.push(safeSendTelegram(user.telegramChatId, text));
+  if (user.whatsappFrom) tasks.push(safeSendWhatsApp(user.whatsappFrom, text));
+
+  if (tasks.length === 0) {
+    logger.warn({ event: "send_skip", user_key: user.userKey, reason: "no_channels" });
+    return;
+  }
+
+  await Promise.allSettled(tasks);
+}
+
 // ---------- AI Reply ----------
 async function coachReply(user, text) {
   const name = user.name || user.firstName || "warrior";
   const goals = user.goalsText || user.habitsText || "No mission defined.";
 
   if (!hasOpenAI) {
-    logger.warn({ event: "openai_missing", user_id: user.chatId });
+    logger.warn({ event: "openai_missing", user_key: user.userKey });
     return `${name}, system offline.\nYour mission:\n${goals}`;
   }
 
   try {
     logger.info({
       event: "openai_call",
-      user_id: user.chatId,
+      user_key: user.userKey,
       model: OPENAI_MODEL,
       text_len: (text || "").length,
     });
@@ -251,7 +349,7 @@ async function coachReply(user, text) {
   } catch (err) {
     logger.error({
       event: "openai_error",
-      user_id: user.chatId,
+      user_key: user.userKey,
       err: err?.message || String(err),
     });
 
@@ -259,11 +357,173 @@ async function coachReply(user, text) {
   }
 }
 
-// ---------- COMMANDS ----------
+// ---------- Core message handler (shared by Telegram + WhatsApp) ----------
+async function handleIncoming({ channel, user, text }) {
+  const d = todayDate();
+  if (!user.logs[d]) user.logs[d] = {};
+
+  const clean = (text || "").trim();
+  const lowered = clean.toLowerCase();
+
+  // START equivalent for WhatsApp (and optional for Telegram non-slash)
+  const isStartWord = ["start", "help", "menu"].includes(lowered);
+
+  // If user types /start in WhatsApp (some people do), treat same
+  const isSlashStart = lowered === "/start";
+
+  // ---------- Start flow ----------
+  if ((channel === "whatsapp" && (isStartWord || isSlashStart)) || (channel === "telegram" && lowered === "/start")) {
+    // Already onboarded → show summary
+    if (user.onboarded) {
+      const s = user.stats;
+      const summary =
+        "MindArsenal Coach online.\nYou are enlisted.\n\n" +
+        `Name: ${user.name || user.firstName}\n` +
+        `Zone: ${user.timezone}\n` +
+        `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
+        `Mission:\n${user.goalsText}\n\n` +
+        "Discipline:\n" +
+        `• Full execution days: ${s.daysWithBoth}/${s.totalDays}\n` +
+        `• Current streak: ${s.streakCurrent}\n` +
+        `• Best streak: ${s.streakBest}`;
+
+      await sendToUser(user, summary);
+      return;
+    }
+
+    // NEW USER FLOW
+    user.onboardingStep = "name";
+    saveUsers(users);
+
+    await sendToUser(user, BETA_WELCOME_MESSAGE);
+    await sendToUser(user, "MindArsenal Coach online.\nStep 1/5 — Name.\nHow do I address you?");
+    return;
+  }
+
+  // Telegram-only slash commands (keep your behavior)
+  if (channel === "telegram" && clean.startsWith("/")) return;
+
+  // ---------- ONBOARDING FLOW ----------
+  if (user.onboardingStep) {
+    const step = user.onboardingStep;
+    const value = clean;
+
+    if (step === "name") {
+      user.name = value;
+      user.onboardingStep = "timezone";
+      saveUsers(users);
+      await sendToUser(user, "Step 2/5 — Timezone.\nExample: Europe/Zurich");
+      return;
+    }
+
+    if (step === "timezone") {
+      user.timezone = value;
+      user.onboardingStep = "habits";
+      saveUsers(users);
+      await sendToUser(user, "Step 3/5 — Mission.\nSend your TOP 3 habits/goals.");
+      return;
+    }
+
+    if (step === "habits") {
+      user.goalsText = value;
+      user.habitsText = value;
+
+      logger.info({ event: "habit_save", user_key: user.userKey, changed: ["goalsText", "habitsText"] });
+
+      user.onboardingStep = "amTime";
+      saveUsers(users);
+      await sendToUser(user, "Step 4/5 — AM time.\nExample: 07:00");
+      return;
+    }
+
+    if (step === "amTime") {
+      const t = formatTimeString(value);
+      if (!t) {
+        await sendToUser(user, "Invalid format. Use HH:MM (24h).");
+        return;
+      }
+
+      user.amTime = t;
+      user.onboardingStep = "pmTime";
+      saveUsers(users);
+      await sendToUser(user, "Step 5/5 — PM time.\nExample: 21:00");
+      return;
+    }
+
+    if (step === "pmTime") {
+      const t = formatTimeString(value);
+      if (!t) {
+        await sendToUser(user, "Invalid format. Use HH:MM (24h).");
+        return;
+      }
+
+      user.pmTime = t;
+      user.onboardingStep = null;
+      user.onboarded = true;
+      saveUsers(users);
+
+      const summary =
+        "Onboarding complete.\nProtocol armed.\n\n" +
+        `Name: ${user.name}\n` +
+        `Zone: ${user.timezone}\n` +
+        `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
+        `Mission:\n${user.goalsText}\n\n` +
+        "Reports will hit at your times.\nRespond. No excuses.";
+
+      await sendToUser(user, summary);
+      return;
+    }
+  }
+
+  // ---------- SETGOALS flow (WhatsApp keyword + Telegram command still exists separately) ----------
+  if (user.pending === "setgoals") {
+    user.goalsText = clean;
+    user.habitsText = clean;
+    user.pending = null;
+
+    logger.info({ event: "habit_save", user_key: user.userKey, changed: ["goalsText", "habitsText"] });
+
+    saveUsers(users);
+    await sendToUser(user, "Mission updated:\n" + user.goalsText);
+    return;
+  }
+
+  // AM
+  if (user.pending === "am") {
+    user.logs[d].am = { text: clean, timestamp: new Date().toISOString() };
+    user.pending = null;
+    saveUsers(users);
+
+    logger.info({ event: "am_reply", user_key: user.userKey, date: d });
+
+    await sendToUser(user, "Dawn Report logged.\nExecute.");
+    return;
+  }
+
+  // PM
+  if (user.pending === "pm") {
+    user.logs[d].pm = { text: clean, timestamp: new Date().toISOString() };
+    user.pending = null;
+
+    updateDailyStats(user, d);
+    saveUsers(users);
+
+    logger.info({ event: "pm_reply", user_key: user.userKey, date: d });
+
+    await sendToUser(user, "Nightly Debrief logged.\nTomorrow the standard rises.");
+    return;
+  }
+
+  // ---------- AI fallback ----------
+  const reply = await coachReply(user, clean);
+  await sendToUser(user, reply);
+}
+
+// ---------- TELEGRAM COMMANDS (kept) ----------
 
 // /gpt test
 bot.onText(/\/gpt/, async (msg) => {
-  if (!hasOpenAI) return safeSend(msg.chat.id, "OpenAI missing.");
+  if (!hasOpenAI) return safeSendTelegram(msg.chat.id, "OpenAI missing.");
 
   try {
     const res = await openai.chat.completions.create({
@@ -274,70 +534,61 @@ bot.onText(/\/gpt/, async (msg) => {
       ],
     });
 
-    safeSend(msg.chat.id, res.choices[0].message.content.trim());
+    safeSendTelegram(msg.chat.id, res.choices[0].message.content.trim());
   } catch (err) {
-    logger.error({ event: "openai_error", user_id: String(msg.chat.id), err: err?.message || String(err) });
-    safeSend(msg.chat.id, "OpenAI failed.");
+    logger.error({ event: "openai_error", user_key: `tg:${String(msg.chat.id)}`, err: err?.message || String(err) });
+    safeSendTelegram(msg.chat.id, "OpenAI failed.");
   }
 });
 
-// /start
-bot.onText(/\/start/, (msg) => {
-  const user = ensureUser(msg);
-  const chatId = user.chatId;
-
-  // Already onboarded → show summary
-  if (user.onboarded) {
-    const s = user.stats;
-    const summary =
-      "MindArsenal Coach online.\nYou are enlisted.\n\n" +
-      `Name: ${user.name || user.firstName}\n` +
-      `Zone: ${user.timezone}\n` +
-      `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
-      `Mission:\n${user.goalsText}\n\n` +
-      "Discipline:\n" +
-      `• Full execution days: ${s.daysWithBoth}/${s.totalDays}\n` +
-      `• Current streak: ${s.streakCurrent}\n` +
-      `• Best streak: ${s.streakBest}`;
-
-    safeSend(chatId, summary);
-    return;
-  }
-
-  // NEW USER FLOW
-  user.onboardingStep = "name";
-  saveUsers(users);
-
-  safeSend(chatId, BETA_WELCOME_MESSAGE).then(() => {
-    safeSend(
-      chatId,
-      "MindArsenal Coach online.\n" + "Step 1/5 — Name.\nHow do I address you?"
-    );
+// /start -> uses shared handler (but keep existing behavior identical)
+bot.onText(/\/start/, async (msg) => {
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
   });
+
+  await handleIncoming({ channel: "telegram", user, text: "/start" });
 });
 
 // /onboard
-bot.onText(/\/onboard/, (msg) => {
-  const user = ensureUser(msg);
+bot.onText(/\/onboard/, async (msg) => {
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
+
   user.onboardingStep = "name";
   user.onboarded = false;
   saveUsers(users);
 
-  safeSend(user.chatId, "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?");
+  safeSendTelegram(user.telegramChatId, "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?");
 });
 
 // /setgoals
-bot.onText(/\/setgoals/, (msg) => {
-  const user = ensureUser(msg);
+bot.onText(/\/setgoals/, async (msg) => {
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
+
   user.pending = "setgoals";
   saveUsers(users);
 
-  safeSend(user.chatId, "Update mission.\nSend your TOP 3 habits/goals.");
+  safeSendTelegram(user.telegramChatId, "Update mission.\nSend your TOP 3 habits/goals.");
 });
 
 // /status
 bot.onText(/\/status/, (msg) => {
-  const user = ensureUser(msg);
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
+
   const d = todayDate();
   const day = user.logs[d] || {};
   const s = user.stats;
@@ -351,45 +602,60 @@ bot.onText(/\/status/, (msg) => {
     `• Streak: ${s.streakCurrent}\n` +
     `• Best: ${s.streakBest}`;
 
-  safeSend(user.chatId, txt);
+  safeSendTelegram(user.telegramChatId, txt);
 });
 
 // /test_am
 bot.onText(/\/test_am/, (msg) => {
-  const user = ensureUser(msg);
-  if (!user.onboarded) return safeSend(user.chatId, "Complete onboarding first.");
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
+
+  if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "Complete onboarding first.");
 
   const d = todayDate();
   if (!user.logs[d]) user.logs[d] = {};
 
-  safeSend(user.chatId, AM_PROMPT);
+  sendToUser(user, AM_PROMPT);
   user.pending = "am";
   user.logs[d].amPromptSent = true;
   saveUsers(users);
 
-  logger.info({ event: "job_fire", job: "am_prompt_manual", user_id: user.chatId });
+  logger.info({ event: "job_fire", job: "am_prompt_manual", user_key: user.userKey });
 });
 
 // /test_pm
 bot.onText(/\/test_pm/, (msg) => {
-  const user = ensureUser(msg);
-  if (!user.onboarded) return safeSend(user.chatId, "Complete onboarding first.");
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
+
+  if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "Complete onboarding first.");
 
   const d = todayDate();
   if (!user.logs[d]) user.logs[d] = {};
 
-  safeSend(user.chatId, PM_PROMPT);
+  sendToUser(user, PM_PROMPT);
   user.pending = "pm";
   user.logs[d].pmPromptSent = true;
   saveUsers(users);
 
-  logger.info({ event: "job_fire", job: "pm_prompt_manual", user_id: user.chatId });
+  logger.info({ event: "job_fire", job: "pm_prompt_manual", user_key: user.userKey });
 });
 
 // /test_weekly
 bot.onText(/\/test_weekly/, (msg) => {
-  const user = ensureUser(msg);
-  if (!user.onboarded) return safeSend(user.chatId, "No data yet.");
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
+
+  if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "No data yet.");
 
   const today = new Date();
   const todayStr = todayDate();
@@ -411,8 +677,8 @@ bot.onText(/\/test_weekly/, (msg) => {
 
   const rate = total ? Math.round((full / total) * 100) : 0;
 
-  safeSend(
-    user.chatId,
+  sendToUser(
+    user,
     "Weekly War Report.\n\n" +
       `Last 7 days (to ${todayStr}):\n` +
       `• Execution rate: ${rate}%\n` +
@@ -420,128 +686,204 @@ bot.onText(/\/test_weekly/, (msg) => {
       "This week is dead.\nThe next one is unbuilt.\nDominate it."
   );
 
-  logger.info({ event: "job_fire", job: "weekly_manual", user_id: user.chatId, rate, full, total });
+  logger.info({ event: "job_fire", job: "weekly_manual", user_key: user.userKey, rate, full, total });
 });
 
-// ---------- MESSAGE ROUTER ----------
+// Telegram message router -> shared handler
 bot.on("message", async (msg) => {
   const text = msg.text || "";
 
   logger.info({
     event: "msg_in",
+    channel: "telegram",
     user_id: String(msg?.from?.id || ""),
     chat_id: String(msg?.chat?.id || ""),
     has_text: !!msg.text,
     text_len: (text || "").length,
   });
 
-  if (text.startsWith("/")) return;
+  const userKey = `tg:${String(msg.chat.id)}`;
+  const user = ensureUserByKey(userKey, {
+    telegramChatId: String(msg.chat.id),
+    firstName: msg.chat.first_name || "",
+  });
 
-  const user = ensureUser(msg);
+  await handleIncoming({ channel: "telegram", user, text });
+});
+
+// ---------- WhatsApp Webhook Server ----------
+const app = express();
+
+// Twilio posts application/x-www-form-urlencoded by default
+app.use(bodyParser.urlencoded({ extended: false }));
+
+// Health check (useful on Render)
+app.get("/health", (req, res) => res.status(200).send("OK"));
+
+// Twilio inbound webhook
+app.post("/webhooks/whatsapp", async (req, res) => {
+  try {
+    const fromRaw = req.body.From || ""; // "whatsapp:+41..."
+    const body = (req.body.Body || "").trim();
+
+    const fromPhone = normalizeWhatsAppFrom(fromRaw);
+    const userKey = `wa:${fromPhone}`;
+
+    logger.info({
+      event: "msg_in",
+      channel: "whatsapp",
+      from: fromPhone,
+      text_len: (body || "").length,
+    });
+
+    const user = ensureUserByKey(userKey, {
+      whatsappFrom: fromPhone,
+      firstName: "", // WhatsApp doesn't provide name via Twilio webhook
+    });
+
+    // We respond to Twilio using TwiML
+    // We still run full logic, but IMPORTANT:
+    // - sendToUser() will attempt to send via WhatsApp using API (fine),
+    // - and the TwiML response will also send one message.
+    //
+    // To avoid DOUBLE reply, we will:
+    // 1) Generate reply by calling handleIncoming but with a flag to not call sendToUser directly.
+    // Simpler: for WhatsApp inbound, we will run a "local send" only for this message.
+
+    // Minimal: emulate the same logic but return one text reply.
+    const replyText = await handleIncomingWhatsAppReturnText(user, body);
+
+    const twiml = new twilio.twiml.MessagingResponse();
+    twiml.message(replyText || "Stand by. Retry.");
+    res.type("text/xml").send(twiml.toString());
+  } catch (e) {
+    logger.error({ event: "whatsapp_webhook_error", err: e?.message || String(e) });
+    const twiml = new twilio.twiml.MessagingResponse();
+    twiml.message("System fault. Retry. Stay sharp.");
+    res.type("text/xml").send(twiml.toString());
+  }
+});
+
+// This variant returns ONE message for the webhook response (no double sends).
+async function handleIncomingWhatsAppReturnText(user, text) {
   const d = todayDate();
-
   if (!user.logs[d]) user.logs[d] = {};
 
-  // ONBOARDING FLOW
+  const clean = (text || "").trim();
+  const lowered = clean.toLowerCase();
+
+  const isStart = ["start", "/start", "help", "menu"].includes(lowered);
+
+  if (isStart) {
+    if (user.onboarded) {
+      const s = user.stats;
+      return (
+        "MindArsenal Coach online.\nYou are enlisted.\n\n" +
+        `Name: ${user.name || user.firstName || "warrior"}\n` +
+        `Zone: ${user.timezone}\n` +
+        `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
+        `Mission:\n${user.goalsText}\n\n` +
+        "Discipline:\n" +
+        `• Full execution days: ${s.daysWithBoth}/${s.totalDays}\n` +
+        `• Current streak: ${s.streakCurrent}\n` +
+        `• Best streak: ${s.streakBest}`
+      );
+    }
+
+    user.onboardingStep = "name";
+    saveUsers(users);
+    // For WhatsApp, we return the FIRST message only (keep it short)
+    return BETA_WELCOME_MESSAGE + "\n\nStep 1/5 — Name.\nHow do I address you?";
+  }
+
+  // ONBOARDING
   if (user.onboardingStep) {
     const step = user.onboardingStep;
-    const value = text.trim();
+    const value = clean;
 
     if (step === "name") {
       user.name = value;
       user.onboardingStep = "timezone";
       saveUsers(users);
-      return safeSend(user.chatId, "Step 2/5 — Timezone.\nExample: Europe/Zurich");
+      return "Step 2/5 — Timezone.\nExample: Europe/Zurich";
     }
 
     if (step === "timezone") {
       user.timezone = value;
       user.onboardingStep = "habits";
       saveUsers(users);
-      return safeSend(user.chatId, "Step 3/5 — Mission.\nSend your TOP 3 habits/goals.");
+      return "Step 3/5 — Mission.\nSend your TOP 3 habits/goals.";
     }
 
     if (step === "habits") {
       user.goalsText = value;
       user.habitsText = value;
-
-      logger.info({ event: "habit_save", user_id: user.chatId, changed: ["goalsText", "habitsText"] });
-
       user.onboardingStep = "amTime";
       saveUsers(users);
-      return safeSend(user.chatId, "Step 4/5 — AM time.\nExample: 07:00");
+      return "Step 4/5 — AM time.\nExample: 07:00";
     }
 
     if (step === "amTime") {
       const t = formatTimeString(value);
-      if (!t) return safeSend(user.chatId, "Invalid format. Use HH:MM (24h).");
-
+      if (!t) return "Invalid format. Use HH:MM (24h).";
       user.amTime = t;
       user.onboardingStep = "pmTime";
       saveUsers(users);
-      return safeSend(user.chatId, "Step 5/5 — PM time.\nExample: 21:00");
+      return "Step 5/5 — PM time.\nExample: 21:00";
     }
 
     if (step === "pmTime") {
       const t = formatTimeString(value);
-      if (!t) return safeSend(user.chatId, "Invalid format. Use HH:MM (24h).");
-
+      if (!t) return "Invalid format. Use HH:MM (24h).";
       user.pmTime = t;
       user.onboardingStep = null;
       user.onboarded = true;
       saveUsers(users);
 
-      const summary =
+      return (
         "Onboarding complete.\nProtocol armed.\n\n" +
         `Name: ${user.name}\n` +
         `Zone: ${user.timezone}\n` +
         `AM: ${user.amTime}\nPM: ${user.pmTime}\n\n` +
         `Mission:\n${user.goalsText}\n\n` +
-        "Reports will hit at your times.\nRespond. No excuses.";
-
-      return safeSend(user.chatId, summary);
+        "Reports will hit at your times.\nRespond. No excuses."
+      );
     }
   }
 
-  // SETGOALS flow
+  // Pending flows
   if (user.pending === "setgoals") {
-    user.goalsText = text.trim();
-    user.habitsText = text.trim();
+    user.goalsText = clean;
+    user.habitsText = clean;
     user.pending = null;
-
-    logger.info({ event: "habit_save", user_id: user.chatId, changed: ["goalsText", "habitsText"] });
-
     saveUsers(users);
-    return safeSend(user.chatId, "Mission updated:\n" + user.goalsText);
+    return "Mission updated:\n" + user.goalsText;
   }
 
-  // AM
   if (user.pending === "am") {
-    user.logs[d].am = { text, timestamp: new Date().toISOString() };
+    user.logs[d].am = { text: clean, timestamp: new Date().toISOString() };
     user.pending = null;
     saveUsers(users);
-
-    logger.info({ event: "am_reply", user_id: user.chatId, date: d });
-
-    return safeSend(user.chatId, "Dawn Report logged.\nExecute.");
+    return "Dawn Report logged.\nExecute.";
   }
 
-  // PM
   if (user.pending === "pm") {
-    user.logs[d].pm = { text, timestamp: new Date().toISOString() };
+    user.logs[d].pm = { text: clean, timestamp: new Date().toISOString() };
     user.pending = null;
-
     updateDailyStats(user, d);
     saveUsers(users);
-
-    logger.info({ event: "pm_reply", user_id: user.chatId, date: d });
-
-    return safeSend(user.chatId, "Nightly Debrief logged.\nTomorrow the standard rises.");
+    return "Nightly Debrief logged.\nTomorrow the standard rises.";
   }
 
-  // AI fallback
-  const reply = await coachReply(user, text);
-  safeSend(user.chatId, reply);
+  // AI
+  const reply = await coachReply(user, clean);
+  return reply;
+}
+
+// Start Express server (Render needs this)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info({ event: "http_listen", port: PORT });
 });
 
 // ---------- CRON: AM/PM per user ----------
@@ -552,7 +894,6 @@ cron.schedule("* * * * *", () => {
   const current = `${hh}:${mm}`;
   const d = todayDate();
 
-  // mark tick so watchdog can detect if cron is dead
   markJob("cron_tick_am_pm", "ok", { current });
 
   let changed = false;
@@ -564,22 +905,19 @@ cron.schedule("* * * * *", () => {
     const day = user.logs[d];
 
     if (current === user.amTime && !day.amPromptSent) {
-      safeSend(user.chatId, AM_PROMPT);
+      // Send to both channels if present
+      sendToUser(user, AM_PROMPT);
       user.pending = "am";
       day.amPromptSent = true;
-
-      logger.info({ event: "job_fire", job: "am_prompt", user_id: user.chatId, at: current });
-
+      logger.info({ event: "job_fire", job: "am_prompt", user_key: user.userKey, at: current });
       changed = true;
     }
 
     if (current === user.pmTime && !day.pmPromptSent) {
-      safeSend(user.chatId, PM_PROMPT);
+      sendToUser(user, PM_PROMPT);
       user.pending = "pm";
       day.pmPromptSent = true;
-
-      logger.info({ event: "job_fire", job: "pm_prompt", user_id: user.chatId, at: current });
-
+      logger.info({ event: "job_fire", job: "pm_prompt", user_key: user.userKey, at: current });
       changed = true;
     }
   });
@@ -631,8 +969,8 @@ cron.schedule("0 18 * * 0", () => {
 
     const rate = total ? Math.round((full / total) * 100) : 0;
 
-    safeSend(
-      user.chatId,
+    sendToUser(
+      user,
       "Weekly War Report.\n\n" +
         `Last 7 days (to ${todayStr}):\n` +
         `• Execution rate: ${rate}%\n` +
@@ -640,16 +978,16 @@ cron.schedule("0 18 * * 0", () => {
         "This week is dead.\nThe next one is unbuilt.\nDominate it."
     );
 
-    logger.info({ event: "weekly_sent", user_id: user.chatId, rate, full, total });
+    logger.info({ event: "weekly_sent", user_key: user.userKey, rate, full, total });
   });
 });
 
-// ---------- Startup Ping ----------
+// ---------- Startup Ping (Telegram only, to avoid WhatsApp spam) ----------
 Object.values(users).forEach((user) => {
-  safeSend(user.chatId, STARTUP_PING);
+  if (user.telegramChatId) safeSendTelegram(user.telegramChatId, STARTUP_PING);
 });
 
-logger.info({ event: "boot", msg: "MindArsenal bot running. Polling started." });
+logger.info({ event: "boot", msg: "MindArsenal bot running. Telegram polling started. HTTP server active." });
 
 // ---------- Crash visibility ----------
 process.on("unhandledRejection", (reason) => {
@@ -659,4 +997,8 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   logger.fatal({ event: "uncaughtException", err: err?.stack || err?.message || String(err) });
   process.exit(1);
+});
+
+bot.on("polling_error", (err) => {
+  logger.error({ event: "polling_error", err: err?.message || String(err) });
 });
