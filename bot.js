@@ -13,10 +13,16 @@ const twilio = require("twilio");
 const logger = require("./logger");
 
 // ---------- ENV ----------
+const disableTelegram = process.env.DISABLE_TELEGRAM_POLLING === "true";
+const disableCron = process.env.DISABLE_CRON === "true";
+
 const token = process.env.BOT_TOKEN;
 
+// Log env presence (not values)
 logger.info({
   event: "env",
+  DISABLE_TELEGRAM_POLLING: disableTelegram,
+  DISABLE_CRON: disableCron,
   OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
   BOT_TOKEN: !!process.env.BOT_TOKEN,
   TWILIO_ACCOUNT_SID: !!process.env.TWILIO_ACCOUNT_SID,
@@ -24,13 +30,14 @@ logger.info({
   TWILIO_WHATSAPP_FROM: !!process.env.TWILIO_WHATSAPP_FROM,
 });
 
-if (!token) {
-  logger.fatal({ event: "fatal", msg: "BOT_TOKEN missing in .env" });
+// Only require BOT_TOKEN if Telegram polling is enabled
+if (!token && !disableTelegram) {
+  logger.fatal({ event: "fatal", msg: "BOT_TOKEN missing but Telegram polling enabled" });
   process.exit(1);
 }
 
 // ---------- Telegram ----------
-const bot = new TelegramBot(token, { polling: true });
+const bot = disableTelegram ? null : new TelegramBot(token, { polling: true });
 
 // ---------- OpenAI ----------
 const hasOpenAI = !!process.env.OPENAI_API_KEY;
@@ -230,6 +237,11 @@ function updateDailyStats(user, dateStr) {
 
 // ---------- Sending (Telegram + WhatsApp) ----------
 async function safeSendTelegram(chatId, text, extra = {}) {
+  if (!bot) {
+    logger.warn({ event: "send_skip", channel: "telegram", reason: "telegram_disabled" });
+    return null;
+  }
+
   try {
     const res = await bot.sendMessage(chatId, text, extra);
 
@@ -267,9 +279,10 @@ async function safeSendWhatsApp(whatsappTo, text) {
   }
 
   try {
+    const toFormatted = `whatsapp:${whatsappTo.startsWith("+") ? whatsappTo : "+" + whatsappTo}`;
     const res = await twilioClient.messages.create({
       from: TWILIO_WHATSAPP_FROM,
-      to: `whatsapp:${whatsappTo.startsWith("+") ? whatsappTo : "+" + whatsappTo}`,
+      to: toFormatted,
       body: text,
     });
 
@@ -367,13 +380,13 @@ async function handleIncoming({ channel, user, text }) {
 
   // START equivalent for WhatsApp (and optional for Telegram non-slash)
   const isStartWord = ["start", "help", "menu"].includes(lowered);
-
-  // If user types /start in WhatsApp (some people do), treat same
   const isSlashStart = lowered === "/start";
 
   // ---------- Start flow ----------
-  if ((channel === "whatsapp" && (isStartWord || isSlashStart)) || (channel === "telegram" && lowered === "/start")) {
-    // Already onboarded → show summary
+  if (
+    (channel === "whatsapp" && (isStartWord || isSlashStart)) ||
+    (channel === "telegram" && lowered === "/start")
+  ) {
     if (user.onboarded) {
       const s = user.stats;
       const summary =
@@ -391,7 +404,6 @@ async function handleIncoming({ channel, user, text }) {
       return;
     }
 
-    // NEW USER FLOW
     user.onboardingStep = "name";
     saveUsers(users);
 
@@ -475,7 +487,7 @@ async function handleIncoming({ channel, user, text }) {
     }
   }
 
-  // ---------- SETGOALS flow (WhatsApp keyword + Telegram command still exists separately) ----------
+  // ---------- SETGOALS flow ----------
   if (user.pending === "setgoals") {
     user.goalsText = clean;
     user.habitsText = clean;
@@ -519,197 +531,202 @@ async function handleIncoming({ channel, user, text }) {
   await sendToUser(user, reply);
 }
 
-// ---------- TELEGRAM COMMANDS (kept) ----------
+// ---------- TELEGRAM (ONLY if bot exists) ----------
+if (bot) {
+  // /gpt test
+  bot.onText(/\/gpt/, async (msg) => {
+    if (!hasOpenAI) return safeSendTelegram(msg.chat.id, "OpenAI missing.");
 
-// /gpt test
-bot.onText(/\/gpt/, async (msg) => {
-  if (!hasOpenAI) return safeSendTelegram(msg.chat.id, "OpenAI missing.");
+    try {
+      const res = await openai.chat.completions.create({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: "Short. Ruthless." },
+          { role: "user", content: "Say System online." },
+        ],
+      });
 
-  try {
-    const res = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      messages: [
-        { role: "system", content: "Short. Ruthless." },
-        { role: "user", content: "Say System online." },
-      ],
+      safeSendTelegram(msg.chat.id, res.choices[0].message.content.trim());
+    } catch (err) {
+      logger.error({ event: "openai_error", user_key: `tg:${String(msg.chat.id)}`, err: err?.message || String(err) });
+      safeSendTelegram(msg.chat.id, "OpenAI failed.");
+    }
+  });
+
+  // /start -> shared handler
+  bot.onText(/\/start/, async (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
     });
 
-    safeSendTelegram(msg.chat.id, res.choices[0].message.content.trim());
-  } catch (err) {
-    logger.error({ event: "openai_error", user_key: `tg:${String(msg.chat.id)}`, err: err?.message || String(err) });
-    safeSendTelegram(msg.chat.id, "OpenAI failed.");
-  }
-});
-
-// /start -> uses shared handler (but keep existing behavior identical)
-bot.onText(/\/start/, async (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+    await handleIncoming({ channel: "telegram", user, text: "/start" });
   });
 
-  await handleIncoming({ channel: "telegram", user, text: "/start" });
-});
+  // /onboard
+  bot.onText(/\/onboard/, async (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
 
-// /onboard
-bot.onText(/\/onboard/, async (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+    user.onboardingStep = "name";
+    user.onboarded = false;
+    saveUsers(users);
+
+    safeSendTelegram(user.telegramChatId, "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?");
   });
 
-  user.onboardingStep = "name";
-  user.onboarded = false;
-  saveUsers(users);
+  // /setgoals
+  bot.onText(/\/setgoals/, async (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
 
-  safeSendTelegram(user.telegramChatId, "Onboarding reset.\nStep 1/5 — Name.\nHow do I call you?");
-});
+    user.pending = "setgoals";
+    saveUsers(users);
 
-// /setgoals
-bot.onText(/\/setgoals/, async (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+    safeSendTelegram(user.telegramChatId, "Update mission.\nSend your TOP 3 habits/goals.");
   });
 
-  user.pending = "setgoals";
-  saveUsers(users);
+  // /status
+  bot.onText(/\/status/, (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
 
-  safeSendTelegram(user.telegramChatId, "Update mission.\nSend your TOP 3 habits/goals.");
-});
+    const d = todayDate();
+    const day = user.logs[d] || {};
+    const s = user.stats;
 
-// /status
-bot.onText(/\/status/, (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+    const txt =
+      `Status for ${d}:\n` +
+      `AM: ${day.am ? "DONE" : "MISSING"}\n` +
+      `PM: ${day.pm ? "DONE" : "MISSING"}\n\n` +
+      `All-time:\n` +
+      `• Full days: ${s.daysWithBoth}/${s.totalDays}\n` +
+      `• Streak: ${s.streakCurrent}\n` +
+      `• Best: ${s.streakBest}`;
+
+    safeSendTelegram(user.telegramChatId, txt);
   });
 
-  const d = todayDate();
-  const day = user.logs[d] || {};
-  const s = user.stats;
+  // /test_am
+  bot.onText(/\/test_am/, (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
 
-  const txt =
-    `Status for ${d}:\n` +
-    `AM: ${day.am ? "DONE" : "MISSING"}\n` +
-    `PM: ${day.pm ? "DONE" : "MISSING"}\n\n` +
-    `All-time:\n` +
-    `• Full days: ${s.daysWithBoth}/${s.totalDays}\n` +
-    `• Streak: ${s.streakCurrent}\n` +
-    `• Best: ${s.streakBest}`;
+    if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "Complete onboarding first.");
 
-  safeSendTelegram(user.telegramChatId, txt);
-});
+    const d = todayDate();
+    if (!user.logs[d]) user.logs[d] = {};
 
-// /test_am
-bot.onText(/\/test_am/, (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+    sendToUser(user, AM_PROMPT);
+    user.pending = "am";
+    user.logs[d].amPromptSent = true;
+    saveUsers(users);
+
+    logger.info({ event: "job_fire", job: "am_prompt_manual", user_key: user.userKey });
   });
 
-  if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "Complete onboarding first.");
+  // /test_pm
+  bot.onText(/\/test_pm/, (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
 
-  const d = todayDate();
-  if (!user.logs[d]) user.logs[d] = {};
+    if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "Complete onboarding first.");
 
-  sendToUser(user, AM_PROMPT);
-  user.pending = "am";
-  user.logs[d].amPromptSent = true;
-  saveUsers(users);
+    const d = todayDate();
+    if (!user.logs[d]) user.logs[d] = {};
 
-  logger.info({ event: "job_fire", job: "am_prompt_manual", user_key: user.userKey });
-});
+    sendToUser(user, PM_PROMPT);
+    user.pending = "pm";
+    user.logs[d].pmPromptSent = true;
+    saveUsers(users);
 
-// /test_pm
-bot.onText(/\/test_pm/, (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+    logger.info({ event: "job_fire", job: "pm_prompt_manual", user_key: user.userKey });
   });
 
-  if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "Complete onboarding first.");
+  // /test_weekly
+  bot.onText(/\/test_weekly/, (msg) => {
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
 
-  const d = todayDate();
-  if (!user.logs[d]) user.logs[d] = {};
+    if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "No data yet.");
 
-  sendToUser(user, PM_PROMPT);
-  user.pending = "pm";
-  user.logs[d].pmPromptSent = true;
-  saveUsers(users);
+    const today = new Date();
+    const todayStr = todayDate();
+    const logs = user.logs;
 
-  logger.info({ event: "job_fire", job: "pm_prompt_manual", user_key: user.userKey });
-});
+    let total = 0;
+    let full = 0;
 
-// /test_weekly
-bot.onText(/\/test_weekly/, (msg) => {
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
-  });
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
 
-  if (!user.onboarded) return safeSendTelegram(user.telegramChatId, "No data yet.");
-
-  const today = new Date();
-  const todayStr = todayDate();
-  const logs = user.logs;
-
-  let total = 0;
-  let full = 0;
-
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0, 10);
-
-    if (logs[key]) {
-      total++;
-      if (logs[key].am && logs[key].pm) full++;
+      if (logs[key]) {
+        total++;
+        if (logs[key].am && logs[key].pm) full++;
+      }
     }
-  }
 
-  const rate = total ? Math.round((full / total) * 100) : 0;
+    const rate = total ? Math.round((full / total) * 100) : 0;
 
-  sendToUser(
-    user,
-    "Weekly War Report.\n\n" +
-      `Last 7 days (to ${todayStr}):\n` +
-      `• Execution rate: ${rate}%\n` +
-      `• Full days: ${full}/${total}\n\n` +
-      "This week is dead.\nThe next one is unbuilt.\nDominate it."
-  );
+    sendToUser(
+      user,
+      "Weekly War Report.\n\n" +
+        `Last 7 days (to ${todayStr}):\n` +
+        `• Execution rate: ${rate}%\n` +
+        `• Full days: ${full}/${total}\n\n` +
+        "This week is dead.\nThe next one is unbuilt.\nDominate it."
+    );
 
-  logger.info({ event: "job_fire", job: "weekly_manual", user_key: user.userKey, rate, full, total });
-});
-
-// Telegram message router -> shared handler
-bot.on("message", async (msg) => {
-  const text = msg.text || "";
-
-  logger.info({
-    event: "msg_in",
-    channel: "telegram",
-    user_id: String(msg?.from?.id || ""),
-    chat_id: String(msg?.chat?.id || ""),
-    has_text: !!msg.text,
-    text_len: (text || "").length,
+    logger.info({ event: "job_fire", job: "weekly_manual", user_key: user.userKey, rate, full, total });
   });
 
-  const userKey = `tg:${String(msg.chat.id)}`;
-  const user = ensureUserByKey(userKey, {
-    telegramChatId: String(msg.chat.id),
-    firstName: msg.chat.first_name || "",
+  // Telegram message router -> shared handler
+  bot.on("message", async (msg) => {
+    const text = msg.text || "";
+
+    logger.info({
+      event: "msg_in",
+      channel: "telegram",
+      user_id: String(msg?.from?.id || ""),
+      chat_id: String(msg?.chat?.id || ""),
+      has_text: !!msg.text,
+      text_len: (text || "").length,
+    });
+
+    const userKey = `tg:${String(msg.chat.id)}`;
+    const user = ensureUserByKey(userKey, {
+      telegramChatId: String(msg.chat.id),
+      firstName: msg.chat.first_name || "",
+    });
+
+    await handleIncoming({ channel: "telegram", user, text });
   });
 
-  await handleIncoming({ channel: "telegram", user, text });
-});
+  bot.on("polling_error", (err) => {
+    logger.error({ event: "polling_error", err: err?.message || String(err) });
+  });
+}
 
 // ---------- WhatsApp Webhook Server ----------
 const app = express();
@@ -738,19 +755,9 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
     const user = ensureUserByKey(userKey, {
       whatsappFrom: fromPhone,
-      firstName: "", // WhatsApp doesn't provide name via Twilio webhook
+      firstName: "",
     });
 
-    // We respond to Twilio using TwiML
-    // We still run full logic, but IMPORTANT:
-    // - sendToUser() will attempt to send via WhatsApp using API (fine),
-    // - and the TwiML response will also send one message.
-    //
-    // To avoid DOUBLE reply, we will:
-    // 1) Generate reply by calling handleIncoming but with a flag to not call sendToUser directly.
-    // Simpler: for WhatsApp inbound, we will run a "local send" only for this message.
-
-    // Minimal: emulate the same logic but return one text reply.
     const replyText = await handleIncomingWhatsAppReturnText(user, body);
 
     const twiml = new twilio.twiml.MessagingResponse();
@@ -764,7 +771,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
   }
 });
 
-// This variant returns ONE message for the webhook response (no double sends).
+// Return ONE reply for webhook response (avoid double-sends)
 async function handleIncomingWhatsAppReturnText(user, text) {
   const d = todayDate();
   if (!user.logs[d]) user.logs[d] = {};
@@ -792,7 +799,6 @@ async function handleIncomingWhatsAppReturnText(user, text) {
 
     user.onboardingStep = "name";
     saveUsers(users);
-    // For WhatsApp, we return the FIRST message only (keep it short)
     return BETA_WELCOME_MESSAGE + "\n\nStep 1/5 — Name.\nHow do I address you?";
   }
 
@@ -880,114 +886,123 @@ async function handleIncomingWhatsAppReturnText(user, text) {
   return reply;
 }
 
-// Start Express server (Render needs this)
+// Start Express server (Render needs this for Web Service)
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   logger.info({ event: "http_listen", port: PORT });
 });
 
-// ---------- CRON: AM/PM per user ----------
-cron.schedule("* * * * *", () => {
-  const now = new Date();
-  const hh = String(now.getHours()).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const current = `${hh}:${mm}`;
-  const d = todayDate();
+// ---------- CRON (ONLY if not disabled) ----------
+if (!disableCron) {
+  // ---------- CRON: AM/PM per user ----------
+  cron.schedule("* * * * *", () => {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    const current = `${hh}:${mm}`;
+    const d = todayDate();
 
-  markJob("cron_tick_am_pm", "ok", { current });
+    markJob("cron_tick_am_pm", "ok", { current });
 
-  let changed = false;
+    let changed = false;
 
-  Object.values(users).forEach((user) => {
-    if (!user.onboarded) return;
-    if (!user.logs[d]) user.logs[d] = {};
+    Object.values(users).forEach((user) => {
+      if (!user.onboarded) return;
+      if (!user.logs[d]) user.logs[d] = {};
 
-    const day = user.logs[d];
+      const day = user.logs[d];
 
-    if (current === user.amTime && !day.amPromptSent) {
-      // Send to both channels if present
-      sendToUser(user, AM_PROMPT);
-      user.pending = "am";
-      day.amPromptSent = true;
-      logger.info({ event: "job_fire", job: "am_prompt", user_key: user.userKey, at: current });
-      changed = true;
-    }
-
-    if (current === user.pmTime && !day.pmPromptSent) {
-      sendToUser(user, PM_PROMPT);
-      user.pending = "pm";
-      day.pmPromptSent = true;
-      logger.info({ event: "job_fire", job: "pm_prompt", user_key: user.userKey, at: current });
-      changed = true;
-    }
-  });
-
-  if (changed) saveUsers(users);
-});
-
-// ---------- Watchdog: detect cron stop ----------
-cron.schedule("*/5 * * * *", () => {
-  const last = runtime.jobs["cron_tick_am_pm"]?.last_at;
-  if (!last) return;
-
-  const diffMs = Date.now() - new Date(last).getTime();
-  if (diffMs > 6 * 60 * 1000) {
-    logger.error({
-      event: "watchdog_missed",
-      job: "cron_tick_am_pm",
-      last_at: last,
-      diff_minutes: Math.round(diffMs / 60000),
-    });
-  }
-});
-
-// ---------- CRON: Weekly Report ----------
-cron.schedule("0 18 * * 0", () => {
-  const today = new Date();
-  const todayStr = todayDate();
-
-  markJob("weekly_report", "fired", { when: todayStr });
-  logger.info({ event: "job_fire", job: "weekly_report", date: todayStr });
-
-  Object.values(users).forEach((user) => {
-    if (!user.onboarded) return;
-
-    const logs = user.logs;
-    let total = 0;
-    let full = 0;
-
-    for (let i = 0; i < 7; i++) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
-
-      if (logs[key]) {
-        total++;
-        if (logs[key].am && logs[key].pm) full++;
+      if (current === user.amTime && !day.amPromptSent) {
+        sendToUser(user, AM_PROMPT);
+        user.pending = "am";
+        day.amPromptSent = true;
+        logger.info({ event: "job_fire", job: "am_prompt", user_key: user.userKey, at: current });
+        changed = true;
       }
-    }
 
-    const rate = total ? Math.round((full / total) * 100) : 0;
+      if (current === user.pmTime && !day.pmPromptSent) {
+        sendToUser(user, PM_PROMPT);
+        user.pending = "pm";
+        day.pmPromptSent = true;
+        logger.info({ event: "job_fire", job: "pm_prompt", user_key: user.userKey, at: current });
+        changed = true;
+      }
+    });
 
-    sendToUser(
-      user,
-      "Weekly War Report.\n\n" +
-        `Last 7 days (to ${todayStr}):\n` +
-        `• Execution rate: ${rate}%\n` +
-        `• Full days: ${full}/${total}\n\n` +
-        "This week is dead.\nThe next one is unbuilt.\nDominate it."
-    );
-
-    logger.info({ event: "weekly_sent", user_key: user.userKey, rate, full, total });
+    if (changed) saveUsers(users);
   });
-});
 
-// ---------- Startup Ping (Telegram only, to avoid WhatsApp spam) ----------
-Object.values(users).forEach((user) => {
-  if (user.telegramChatId) safeSendTelegram(user.telegramChatId, STARTUP_PING);
-});
+  // ---------- Watchdog: detect cron stop ----------
+  cron.schedule("*/5 * * * *", () => {
+    const last = runtime.jobs["cron_tick_am_pm"]?.last_at;
+    if (!last) return;
 
-logger.info({ event: "boot", msg: "MindArsenal bot running. Telegram polling started. HTTP server active." });
+    const diffMs = Date.now() - new Date(last).getTime();
+    if (diffMs > 6 * 60 * 1000) {
+      logger.error({
+        event: "watchdog_missed",
+        job: "cron_tick_am_pm",
+        last_at: last,
+        diff_minutes: Math.round(diffMs / 60000),
+      });
+    }
+  });
+
+  // ---------- CRON: Weekly Report ----------
+  cron.schedule("0 18 * * 0", () => {
+    const today = new Date();
+    const todayStr = todayDate();
+
+    markJob("weekly_report", "fired", { when: todayStr });
+    logger.info({ event: "job_fire", job: "weekly_report", date: todayStr });
+
+    Object.values(users).forEach((user) => {
+      if (!user.onboarded) return;
+
+      const logs = user.logs;
+      let total = 0;
+      let full = 0;
+
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        const key = d.toISOString().slice(0, 10);
+
+        if (logs[key]) {
+          total++;
+          if (logs[key].am && logs[key].pm) full++;
+        }
+      }
+
+      const rate = total ? Math.round((full / total) * 100) : 0;
+
+      sendToUser(
+        user,
+        "Weekly War Report.\n\n" +
+          `Last 7 days (to ${todayStr}):\n` +
+          `• Execution rate: ${rate}%\n` +
+          `• Full days: ${full}/${total}\n\n` +
+          "This week is dead.\nThe next one is unbuilt.\nDominate it."
+      );
+
+      logger.info({ event: "weekly_sent", user_key: user.userKey, rate, full, total });
+    });
+  });
+} else {
+  logger.info({ event: "cron_disabled" });
+}
+
+// ---------- Startup Ping (Telegram only) ----------
+if (bot) {
+  Object.values(users).forEach((user) => {
+    if (user.telegramChatId) safeSendTelegram(user.telegramChatId, STARTUP_PING);
+  });
+}
+
+logger.info({
+  event: "boot",
+  msg: `MindArsenal running. http=${PORT} telegram_polling=${!!bot} cron=${!disableCron}`,
+});
 
 // ---------- Crash visibility ----------
 process.on("unhandledRejection", (reason) => {
@@ -997,8 +1012,4 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   logger.fatal({ event: "uncaughtException", err: err?.stack || err?.message || String(err) });
   process.exit(1);
-});
-
-bot.on("polling_error", (err) => {
-  logger.error({ event: "polling_error", err: err?.message || String(err) });
 });
